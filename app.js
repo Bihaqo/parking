@@ -946,7 +946,8 @@ $('routeBtn').addEventListener('click', () => {
 // The tape is exposed as a draggable timeline: drag to move back/forth through the
 // run, the ▶/⏸ button plays it, and a teal tick marks where the planner took over.
 const track = $('track'), thumb = $('thumb'), tfill = $('tfill'),
-      boundaryMark = $('boundaryMark'), playBtn = $('playBtn'), tlabel = $('tlabel');
+      boundaryMark = $('boundaryMark'), boundaryLabel = $('boundaryLabel'),
+      playBtn = $('playBtn'), tlabel = $('tlabel');
 
 function poseAt(c) { // interpolate between tape samples so scrubbing is smooth
   const i = clamp(Math.floor(c), 0, tape.length - 1);
@@ -1016,10 +1017,11 @@ function updateTimeline() {
   const frac = atLive ? 1 : (n > 1 ? cursor / (n - 1) : 0);
   thumb.style.left = tfill.style.width = (frac * 100) + '%';
   if (boundary > 0 && boundary < n && n > 1) {
-    boundaryMark.style.display = '';
-    boundaryMark.style.left = (boundary / (n - 1) * 100) + '%';
+    const bx = (boundary / (n - 1) * 100) + '%';
+    boundaryMark.style.display = boundaryLabel.style.display = 'block';
+    boundaryMark.style.left = boundaryLabel.style.left = bx;
   } else {
-    boundaryMark.style.display = 'none';
+    boundaryMark.style.display = boundaryLabel.style.display = 'none';
   }
   playBtn.textContent = (replay && autoPlay) ? '⏸' : '▶';
   tlabel.textContent = atLive ? 'live' : Math.round(frac * 100) + '%';

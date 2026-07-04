@@ -49,13 +49,15 @@
   #resetBtn,#routeBtn{width:100%;background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px;font-size:14px;cursor:pointer}
   #resetBtn:hover,#routeBtn:hover{border-color:var(--accent)}
   #routeHint{color:var(--muted);font-size:12px;line-height:1.45;margin-top:-4px}
-  .timeline{display:flex;align-items:center;gap:10px;margin-top:10px;padding:8px 12px;background:var(--panel);border:1px solid var(--line);border-radius:10px}
+  .timeline{display:flex;align-items:center;gap:10px;margin-top:10px;padding:24px 12px 8px;background:var(--panel);border:1px solid var(--line);border-radius:10px}
   .timeline .tbtn{flex:0 0 auto;width:34px;height:34px;border-radius:8px;background:var(--panel2);color:var(--text);border:1px solid var(--line);font-size:13px;cursor:pointer}
   .timeline .tbtn:hover{border-color:var(--accent)}
   .track{position:relative;flex:1 1 auto;height:24px;cursor:pointer;touch-action:none;user-select:none}
   .track::before{content:"";position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);height:6px;border-radius:3px;background:var(--panel2)}
   .fill{position:absolute;left:0;top:50%;transform:translateY(-50%);height:6px;border-radius:3px;background:var(--accent);opacity:.45;width:0;pointer-events:none}
   .bmark{position:absolute;top:50%;transform:translate(-50%,-50%);width:3px;height:20px;border-radius:2px;background:var(--accent);box-shadow:0 0 0 2px rgba(10,14,18,.55);display:none;pointer-events:none}
+  .bmark-label{position:absolute;top:-4px;transform:translate(-50%,-100%);white-space:nowrap;font-size:10px;font-weight:650;letter-spacing:.2px;color:#08302c;background:var(--accent);padding:1px 6px;border-radius:5px;display:none;pointer-events:none}
+  .bmark-label::after{content:"";position:absolute;left:50%;bottom:-3px;transform:translateX(-50%);border:3px solid transparent;border-top-color:var(--accent)}
   .thumb{position:absolute;top:50%;left:0;transform:translate(-50%,-50%);width:15px;height:15px;border-radius:50%;background:var(--text);border:2px solid var(--accent);pointer-events:none}
   .tlabel{flex:0 0 auto;min-width:38px;text-align:right;font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
 </style>
@@ -83,6 +85,7 @@
       <div class="track" id="track">
         <div class="fill" id="tfill"></div>
         <div class="bmark" id="boundaryMark" title="Planner takes over here"></div>
+        <div class="bmark-label" id="boundaryLabel" title="Planner takes over here">you stop · planner ▸</div>
         <div class="thumb" id="thumb"></div>
       </div>
       <div class="tlabel" id="tlabel">live</div>
