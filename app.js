@@ -141,14 +141,14 @@ const settings = {
 try { Object.assign(settings, JSON.parse(localStorage.getItem('parkingTrainer') || '{}')); } catch (e) {}
 const saveSettings = () => { try { localStorage.setItem('parkingTrainer', JSON.stringify(settings)); } catch (e) {} };
 
-let level, car, done, collisions, startTime, elapsed, parkedTimer, flash, lastBumpAt, sensors;
+let level, car, done, collisions, startTime, elapsed, parkedTimer, flash, lastBumpAt, sensors, guideDir;
 const keys = {};
 
 function reset() {
   level = buildLevel(settings.type, settings.tight);
   car = { x: level.start.x, y: level.start.y, theta: level.start.theta, v: 0, steer: 0 };
   done = false; collisions = 0; startTime = null; elapsed = 0;
-  parkedTimer = 0; flash = 0; lastBumpAt = -1;
+  parkedTimer = 0; flash = 0; lastBumpAt = -1; guideDir = 1;
   sensors = { front: [Infinity, Infinity, Infinity], rear: [Infinity, Infinity, Infinity] };
   $('overlay').classList.remove('show');
 }
@@ -214,6 +214,10 @@ function step(dt) {
   const rate = (target === 0 || target * car.v < 0) ? CAR.brake : CAR.accel;
   car.v += clamp(target - car.v, -rate * dt, rate * dt);
   if (target === 0 && Math.abs(car.v) < 0.02) car.v = 0;
+
+  // remember which way we're heading so guides don't snap back to forward at a stop
+  if (fwd !== back) guideDir = fwd ? 1 : -1;
+  else if (Math.abs(car.v) > 0.03) guideDir = car.v > 0 ? 1 : -1;
 
   if (car.v !== 0 && startTime === null) startTime = performance.now();
   if (startTime !== null) elapsed = (performance.now() - startTime) / 1000;
@@ -361,10 +365,9 @@ function drawPlayerCar() {
 
 function drawGuides() {
   if (!settings.guides || done) return;
-  const back = keys.KeyS || keys.ArrowDown;
-  const dir = car.v < -0.03 || (car.v <= 0.03 && back) ? -1 : 1;
+  const dir = guideDir;
   const pose = { x: car.x, y: car.y, theta: car.theta };
-  const ds = 0.15, steps = 46;
+  const ds = 0.15, steps = 28;
   const edgeX = dir > 0 ? CAR.len / 2 : -CAR.len / 2;
   const pathL = [], pathR = [];
   for (let i = 0; i <= steps; i++) {
