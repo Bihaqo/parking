@@ -157,7 +157,7 @@ function reset() {
   parkedTimer = 0; flash = 0; lastBumpAt = -1; guideDir = 1; suppressSuccess = false;
   sensors = { front: [Infinity, Infinity, Infinity], rear: [Infinity, Infinity, Infinity] };
   route = null; boundary = -1;
-  replay = false; autoPlay = false; replayHold = 0; travelAcc = 0;
+  replay = false; autoPlay = false; replayHold = 0; travelAcc = 0; scrubbing = false;
   tape = [tapeSample()]; cursor = 0;
   $('routeHint').style.display = 'none';
   $('routeBtn').textContent = ROUTE_BTN_LABEL;
@@ -584,7 +584,7 @@ function buildRoute(goalNode) {
 const TAPE_DS = PLAN.step / 5;                 // one sample per 8 cm of travel (matches route poses)
 const REPLAY = { speed: 2.0, holdSwitch: 0.5, holdBoundary: 0.6 };
 let tape = [], cursor = 0, boundary = -1;
-let replay = false, autoPlay = false, replayHold = 0, travelAcc = 0;
+let replay = false, autoPlay = false, replayHold = 0, travelAcc = 0, scrubbing = false;
 
 const tapeSample = planned =>
   ({ x: car.x, y: car.y, theta: car.theta, steer: car.steer, dir: guideDir, planned: !!planned });
@@ -603,7 +603,7 @@ function takeOver() { // resume manual control at the replay cursor, discarding 
   const p = tape[cursor];
   car.x = p.x; car.y = p.y; car.theta = p.theta; car.steer = p.steer; car.v = 0;
   if (boundary >= tape.length) boundary = -1;
-  replay = false; autoPlay = false; replayHold = 0; travelAcc = 0; parkedTimer = 0;
+  replay = false; autoPlay = false; replayHold = 0; travelAcc = 0; parkedTimer = 0; scrubbing = false;
 }
 
 function stepReplay(dt) {
@@ -773,7 +773,7 @@ function drawOverlays() {
     ctx.save(); ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
     ctx.fillStyle = 'rgba(232,236,241,0.75)';
     ctx.font = '600 13px system-ui'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
-    ctx.fillText((autoPlay ? 'PREVIEW' : 'REPLAY') + ' — Z ◀ · X ▶ · steer to take over', 12, 10);
+    ctx.fillText((autoPlay ? '▶ PLAYING' : '⏸ PAUSED') + ' — drag the timeline · steer to take over', 12, 10);
     ctx.restore();
   }
 }
@@ -942,6 +942,89 @@ $('routeBtn').addEventListener('click', () => {
   $('routeHint').style.display = '';
 });
 
+// ---------------------------------------------------------------- timeline scrubber
+// The tape is exposed as a draggable timeline: drag to move back/forth through the
+// run, the ▶/⏸ button plays it, and a teal tick marks where the planner took over.
+const track = $('track'), thumb = $('thumb'), tfill = $('tfill'),
+      boundaryMark = $('boundaryMark'), playBtn = $('playBtn'), tlabel = $('tlabel');
+
+function poseAt(c) { // interpolate between tape samples so scrubbing is smooth
+  const i = clamp(Math.floor(c), 0, tape.length - 1);
+  const j = Math.min(i + 1, tape.length - 1);
+  const f = c - i, a = tape[i], b = tape[j];
+  return {
+    x: a.x + (b.x - a.x) * f,
+    y: a.y + (b.y - a.y) * f,
+    theta: a.theta + wrapPi(b.theta - a.theta) * f,
+    steer: a.steer + (b.steer - a.steer) * f,
+    dir: f < 0.5 ? a.dir : b.dir,
+  };
+}
+
+function beginScrub() { // freeze at the live edge so the tape stops growing, then let the mouse move the cursor
+  if (done) return false;
+  if (!replay) {
+    const last = tape[tape.length - 1];
+    if (Math.hypot(car.x - last.x, car.y - last.y) > 1e-3) tape.push(tapeSample());
+    replay = true;
+  }
+  autoPlay = false; replayHold = 0; car.v = 0;
+  return true;
+}
+
+function scrubTo(frac) {
+  cursor = clamp(frac * (tape.length - 1), 0, tape.length - 1);
+  const p = poseAt(cursor);
+  car.x = p.x; car.y = p.y; car.theta = p.theta; car.steer = p.steer;
+  guideDir = p.dir; car.v = 0;
+}
+
+const fracFromEvent = e => {
+  const r = track.getBoundingClientRect();
+  return clamp((e.clientX - r.left) / r.width, 0, 1);
+};
+
+track.addEventListener('pointerdown', e => {
+  ensureAudio();
+  if (!beginScrub()) return;            // clicking a point stops playback and holds still
+  scrubbing = true;
+  try { track.setPointerCapture(e.pointerId); } catch (_) {}
+  scrubTo(fracFromEvent(e)); e.preventDefault();
+});
+track.addEventListener('pointermove', e => { if (scrubbing) scrubTo(fracFromEvent(e)); });
+const endScrub = e => {
+  if (!scrubbing) return;
+  scrubbing = false;
+  try { track.releasePointerCapture(e.pointerId); } catch (_) {}
+};
+track.addEventListener('pointerup', endScrub);
+track.addEventListener('pointercancel', endScrub);
+
+function playPause() {
+  ensureAudio();
+  if (done) return;
+  if (replay && autoPlay) { autoPlay = false; return; }   // pause → hold still
+  if (!replay) enterReplay();                             // freeze at the live edge
+  if (cursor >= tape.length - 1) cursor = 0;              // at the end → play from the start
+  scrubbing = false; autoPlay = true;
+}
+playBtn.addEventListener('click', playPause);
+
+function updateTimeline() {
+  const n = tape.length;
+  const atLive = !replay;                                 // while driving you sit at the live edge
+  const frac = atLive ? 1 : (n > 1 ? cursor / (n - 1) : 0);
+  thumb.style.left = tfill.style.width = (frac * 100) + '%';
+  if (boundary > 0 && boundary < n && n > 1) {
+    boundaryMark.style.display = '';
+    boundaryMark.style.left = (boundary / (n - 1) * 100) + '%';
+  } else {
+    boundaryMark.style.display = 'none';
+  }
+  playBtn.textContent = (replay && autoPlay) ? '⏸' : '▶';
+  tlabel.textContent = atLive ? 'live' : Math.round(frac * 100) + '%';
+}
+
 // ---------------------------------------------------------------- main loop
 reset();
 let last = performance.now();
@@ -951,6 +1034,7 @@ function frame(t) {
   step(dt);
   draw();
   updateHUD();
+  updateTimeline();
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
