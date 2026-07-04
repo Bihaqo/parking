@@ -142,19 +142,19 @@ function buildLevel(type, tight) {
 // ---------------------------------------------------------------- state
 const settings = {
   type: 'parallel', tight: 'normal', maxKmh: 4,
-  guides: true, sound: true, autoCenter: false,
+  guides: true, sound: false, autoCenter: false,
 };
 try { Object.assign(settings, JSON.parse(localStorage.getItem('parkingTrainer') || '{}')); } catch (e) {}
 const saveSettings = () => { try { localStorage.setItem('parkingTrainer', JSON.stringify(settings)); } catch (e) {} };
 
-let level, car, done, collisions, startTime, elapsed, parkedTimer, flash, lastBumpAt, sensors, guideDir;
+let level, car, done, collisions, startTime, elapsed, parkedTimer, flash, lastBumpAt, sensors, guideDir, suppressSuccess;
 const keys = {};
 
 function reset() {
   level = buildLevel(settings.type, settings.tight);
   car = { x: level.start.x, y: level.start.y, theta: level.start.theta, v: 0, steer: 0 };
   done = false; collisions = 0; startTime = null; elapsed = 0;
-  parkedTimer = 0; flash = 0; lastBumpAt = -1; guideDir = 1;
+  parkedTimer = 0; flash = 0; lastBumpAt = -1; guideDir = 1; suppressSuccess = false;
   sensors = { front: [Infinity, Infinity, Infinity], rear: [Infinity, Infinity, Infinity] };
   route = null; boundary = -1;
   replay = false; autoPlay = false; replayHold = 0; travelAcc = 0;
@@ -305,7 +305,26 @@ function insideSpotAt(pose) {
 }
 const insideSpot = () => insideSpotAt(car);
 
+// signed gap from the car's curb-side edge to the curb line: + clear, − rolled over it.
+// null when the level has no curb (bay/garage/angled).
+function curbGap(pose) {
+  if (!level.curbCheck) return null;
+  const curbObs = level.obstacles.find(o => o.kind === 'curb');
+  const curbLineY = curbObs.cy - curbObs.h / 2;
+  let maxY = -Infinity;
+  for (const [, y] of boxCorners(carBox(pose))) maxY = Math.max(maxY, y);
+  return curbLineY - maxY;
+}
+
+function continueFromDone() { // dismiss the Done card and keep playing from where you stopped
+  if (!done) return;
+  done = false; parkedTimer = 0; suppressSuccess = true;
+  $('overlay').classList.remove('show');
+}
+
 function checkSuccess(dt) {
+  // after dismissing the Done card, don't pop it again until the car leaves the spot
+  if (suppressSuccess) { if (!insideSpot()) suppressSuccess = false; return; }
   if (insideSpot() && Math.abs(car.v) < 0.05) parkedTimer += dt; else parkedTimer = 0;
   if (parkedTimer < 0.8) return;
   done = true;
@@ -315,14 +334,8 @@ function checkSuccess(dt) {
   const offset = Math.abs(lyc);
 
   // negative clearance means the car is still resting on/over the curb
-  let curbClearance = Infinity;
-  if (level.curbCheck) {
-    const curbObs = level.obstacles.find(o => o.kind === 'curb');
-    const curbLineY = curbObs.cy - curbObs.h / 2;
-    let maxY = -Infinity;
-    for (const [, y] of boxCorners(b)) maxY = Math.max(maxY, y);
-    curbClearance = curbLineY - maxY;
-  }
+  const clr = curbGap(car);
+  const curbClearance = clr === null ? Infinity : clr;
   const onCurb = curbClearance < -0.02;
 
   const stars = (offset < 0.16 && angErr < 0.07 && collisions === 0 && !onCurb) ? 3
@@ -419,6 +432,19 @@ function planRoute() {
       return Math.abs(ly) < 0.15 && ang < 0.08 ? 2 : 1;
     },
   };
+  // spotTargets[0] noses into the spot (drive-in forward); spotTargets[1] noses
+  // out (back-in, so you leave forward). This goal accepts just one of them.
+  const spotGoalOrient = idx => ({
+    targets: [spotTargets[idx]],
+    quality(pose) {
+      if (!insideSpotAt(pose)) return 0;
+      const ang = Math.abs(wrapPi(pose.theta - spotTargets[idx].theta));
+      if (ang > 0.21) return 0; // facing the wrong way round for this goal
+      const b = carBox(pose);
+      const [, ly] = spotFrame(b.cx, b.cy);
+      return Math.abs(ly) < 0.15 && ang < 0.08 ? 2 : 1;
+    },
+  });
   const poseGoal = target => ({
     targets: [target],
     quality: p => Math.hypot(p.x - target.x, p.y - target.y) < 0.22
@@ -492,6 +518,16 @@ function planRoute() {
         if (n2) return concatRoutes(buildRoute(n1), buildRoute(n2));
       }
     }
+  }
+
+  // Bay/garage: prefer backing in (nose out → you leave forward). Plan both ways
+  // and only pick the forward drive-in if it's clearly much simpler than backing in.
+  if (settings.type === 'bay' || settings.type === 'garage') {
+    const backIn = search(start, spotGoalOrient(1));
+    const noseIn = search(start, spotGoalOrient(0));
+    let pick = backIn || noseIn;
+    if (backIn && noseIn && noseIn.g < backIn.g * 0.6) pick = noseIn; // user is clearly set up to pull in forward
+    return pick ? buildRoute(pick) : null;
   }
 
   const n = search(start, spotGoal);
@@ -820,17 +856,19 @@ function draw() {
 }
 
 // ---------------------------------------------------------------- HUD
-function fmtDist(d) { return d > 2 ? '> 2 m' : d.toFixed(2) + ' m'; }
 function updateHUD() {
   $('speedV').textContent = Math.abs(car.v * 3.6).toFixed(1) + ' km/h';
   const fwd = keys.KeyW || keys.ArrowUp, back = keys.KeyS || keys.ArrowDown;
   $('gearV').textContent = car.v > 0.03 || (fwd && !back) ? 'D' : car.v < -0.03 || (back && !fwd) ? 'R' : 'N';
-  const fMin = Math.min(...sensors.front), rMin = Math.min(...sensors.rear);
-  const paint = (el, d) => {
-    el.textContent = fmtDist(d);
-    el.style.color = d < 0.45 ? 'var(--bad)' : d < 0.85 ? 'var(--warn)' : d < 1.4 ? 'var(--good)' : 'var(--text)';
-  };
-  paint($('frontV'), fMin); paint($('rearV'), rMin);
+  const curbEl = $('curbV'), clr = curbGap(car);
+  if (clr === null) {
+    curbEl.textContent = '—'; curbEl.style.color = 'var(--muted)';
+  } else if (clr < -0.005) {
+    curbEl.textContent = 'on curb ' + (-clr).toFixed(2) + ' m'; curbEl.style.color = 'var(--bad)';
+  } else {
+    curbEl.textContent = clr > 2 ? '> 2 m' : clr.toFixed(2) + ' m';
+    curbEl.style.color = clr < 0.1 ? 'var(--bad)' : clr < 0.4 ? 'var(--warn)' : 'var(--good)';
+  }
   const mm = Math.floor(elapsed / 60), ss = Math.floor(elapsed % 60);
   $('timeV').textContent = `${mm}:${String(ss).padStart(2, '0')}`;
   $('bumpV').textContent = collisions;
@@ -843,6 +881,7 @@ const HANDLED = new Set(['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ArrowUp', 'ArrowDown',
 window.addEventListener('keydown', e => {
   if (e.repeat) { if (HANDLED.has(e.code)) e.preventDefault(); return; }
   ensureAudio();
+  if (e.code === 'Escape') { if (done) { continueFromDone(); e.preventDefault(); } return; }
   if (e.code === 'KeyR') { reset(); e.preventDefault(); return; }
   if (HANDLED.has(e.code)) {
     if (replay && e.code !== 'KeyZ' && e.code !== 'KeyX') takeOver(); // steering takes control back
@@ -877,6 +916,7 @@ for (const [id, key] of [['guidesChk', 'guides'], ['soundChk', 'sound'], ['autoC
 }
 $('resetBtn').addEventListener('click', () => { ensureAudio(); reset(); });
 $('againBtn').addEventListener('click', () => reset());
+$('continueBtn').addEventListener('click', () => continueFromDone());
 
 const ROUTE_BTN_LABEL = '🧭 Preview route from here';
 let routeBtnTimer = 0;

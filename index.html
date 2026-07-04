@@ -19,7 +19,9 @@
   canvas{display:block;width:100%;height:auto;border-radius:10px;background:#2b2f33;outline:1px solid var(--line)}
   .overlay{position:absolute;inset:0;display:none;align-items:center;justify-content:center;border-radius:10px;background:rgba(10,14,18,.55);backdrop-filter:blur(2px)}
   .overlay.show{display:flex}
-  .overlay .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px 30px;text-align:center;box-shadow:0 10px 40px rgba(0,0,0,.5)}
+  .overlay .card{position:relative;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px 30px;text-align:center;box-shadow:0 10px 40px rgba(0,0,0,.5)}
+  .overlay .close{position:absolute;top:6px;right:8px;background:none;border:0;color:var(--muted);font-size:22px;line-height:1;padding:2px 8px;cursor:pointer;border-radius:6px;font-weight:400}
+  .overlay .close:hover{background:var(--panel2);color:var(--text)}
   .overlay .stars{font-size:30px;letter-spacing:6px;color:var(--warn)}
   .overlay h2{margin:6px 0 8px;font-size:22px}
   .overlay .det{color:var(--muted);font-size:14px;margin-bottom:14px}
@@ -37,6 +39,7 @@
   label.chk{display:flex;gap:8px;align-items:center;font-size:14px;padding:3px 0;cursor:pointer}
   .dash{display:grid;grid-template-columns:1fr 1fr;gap:8px}
   .tile{background:var(--panel2);border-radius:8px;padding:8px 10px}
+  .tile.wide{grid-column:1 / -1}
   .tile .k{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px}
   .tile .v{font-size:18px;font-weight:650;font-variant-numeric:tabular-nums}
   .steer{display:flex;align-items:center;gap:14px}
@@ -58,10 +61,12 @@
     <canvas id="game"></canvas>
     <div class="overlay" id="overlay">
       <div class="card">
+        <button class="close" id="continueBtn" aria-label="Keep driving from here" title="Keep driving (Esc)">×</button>
         <div class="stars" id="stars">★★★</div>
         <h2>Parked!</h2>
         <div class="det" id="resultDetail"></div>
         <button id="againBtn">Go again (R)</button>
+        <div class="det" style="margin:12px 0 0">Esc or ✕ to keep driving from here</div>
       </div>
     </div>
   </div>
@@ -87,16 +92,17 @@
       <input type="range" id="speedSlider" min="2" max="12" step="0.5" value="4">
       <div style="height:6px"></div>
       <label class="chk"><input type="checkbox" id="guidesChk" checked> Trajectory guides</label>
-      <label class="chk"><input type="checkbox" id="soundChk" checked> Parktronic beeps</label>
+      <label class="chk"><input type="checkbox" id="soundChk"> Parktronic beeps</label>
       <label class="chk"><input type="checkbox" id="autoCenterChk"> Auto-center steering</label>
     </div>
+    <button id="routeBtn">🧭 Preview route from here</button>
+    <div id="routeHint" style="display:none">Solid teal = forward · dashed amber = reverse · white ghosts = gear switches. <kbd>Z</kbd>/<kbd>X</kbd> replay the run backward/forward — rewinding pauses at the teal box where the planner took over. Steer anytime to take control back.</div>
     <div class="box">
       <h3>Dashboard</h3>
       <div class="dash">
         <div class="tile"><div class="k">Speed</div><div class="v" id="speedV">0.0 km/h</div></div>
         <div class="tile"><div class="k">Gear</div><div class="v" id="gearV">N</div></div>
-        <div class="tile"><div class="k">Front</div><div class="v" id="frontV">–</div></div>
-        <div class="tile"><div class="k">Rear</div><div class="v" id="rearV">–</div></div>
+        <div class="tile wide"><div class="k">Curb distance</div><div class="v" id="curbV">—</div></div>
         <div class="tile"><div class="k">Time</div><div class="v" id="timeV">0:00</div></div>
         <div class="tile"><div class="k">Bumps</div><div class="v" id="bumpV">0</div></div>
       </div>
@@ -120,8 +126,6 @@
       <kbd>Space</kbd> straighten wheels &nbsp; <kbd>R</kbd> restart<br>
       <kbd>Z</kbd>/<kbd>X</kbd> replay backward / forward
     </div>
-    <button id="routeBtn">🧭 Preview route from here</button>
-    <div id="routeHint" style="display:none">Solid teal = forward · dashed amber = reverse · white ghosts = gear switches. <kbd>Z</kbd>/<kbd>X</kbd> replay the run backward/forward — rewinding pauses at the teal box where the planner took over. Steer anytime to take control back.</div>
     <button id="resetBtn">↺ Restart (R)</button>
   </aside>
 </div>
