@@ -20,6 +20,8 @@ const CAR = {
 };
 CAR.axleToCenter = CAR.len / 2 - CAR.rearOverhang; // rear axle -> body center
 
+const CURB_LEEWAY = 0.35; // meters you can roll over the curb before it acts as a hard stop
+
 // ---------------------------------------------------------------- geometry
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 const wrapPi = a => { while (a > Math.PI) a -= 2 * Math.PI; while (a < -Math.PI) a += 2 * Math.PI; return a; };
@@ -72,7 +74,11 @@ function buildLevel(type, tight) {
     const curbY = 10.2, laneCy = 9.2;
     zones.push({ cx, cy: (curbY + 11.7) / 2, w: WORLD.w, h: 11.7 - curbY, color: '#3a3f45' });   // sidewalk
     zones.push({ cx, cy: (11.7 + WORLD.h) / 2, w: WORLD.w, h: WORLD.h - 11.7, color: '#26332a' }); // grass
+    // 'curb' is soft: only used for proximity sensors/final scoring, never blocks driving.
     obstacles.push({ cx, cy: (curbY + WORLD.h) / 2, w: WORLD.w, h: WORLD.h - curbY, theta: 0, kind: 'curb' });
+    // 'curbWall' is the real hard stop, set back so you can roll a little over the curb first.
+    const wallY = curbY + CURB_LEEWAY;
+    obstacles.push({ cx, cy: (wallY + WORLD.h) / 2, w: WORLD.w, h: WORLD.h - wallY, theta: 0, kind: 'curbWall' });
     lines.push({ x1: 0, y1: 3.2, x2: WORLD.w, y2: 3.2, color: 'rgba(255,255,255,0.5)', width: 0.1, dash: [1, 1.2] });
     const near = gap / 2 + CAR.len / 2, far = near + CAR.len + 0.9;
     [[-near, 0], [near, 1], [-far, 2], [far, 3]].forEach(([dx, i]) => parkedCar(cx + dx, laneCy, 0, i));
@@ -231,7 +237,7 @@ function step(dt) {
   // collisions
   const box = carBox();
   let hit = carHitsWorld(box) ? 'world' : null;
-  if (!hit) for (const o of level.obstacles) if (boxesCollide(box, o)) { hit = 'obstacle'; break; }
+  if (!hit) for (const o of level.obstacles) if (o.kind !== 'curb' && boxesCollide(box, o)) { hit = 'obstacle'; break; }
   if (hit) {
     car.x = prev.x; car.y = prev.y; car.theta = prev.theta; car.v = 0;
     const now = performance.now();
@@ -293,14 +299,24 @@ function checkSuccess(dt) {
   const [, lyc] = spotFrame(b.cx, b.cy);
   const angErr = Math.min(Math.abs(wrapPi(car.theta - level.spot.theta)), Math.abs(wrapPi(car.theta - level.spot.theta - Math.PI)));
   const offset = Math.abs(lyc);
-  const stars = (offset < 0.16 && angErr < 0.07 && collisions === 0) ? 3
-              : (offset < 0.32 && angErr < 0.14 && collisions <= 1) ? 2 : 1;
+
+  // negative clearance means the car is still resting on/over the curb
+  let curbClearance = Infinity;
+  if (level.curbCheck) {
+    const curbObs = level.obstacles.find(o => o.kind === 'curb');
+    const curbLineY = curbObs.cy - curbObs.h / 2;
+    let maxY = -Infinity;
+    for (const [, y] of boxCorners(b)) maxY = Math.max(maxY, y);
+    curbClearance = curbLineY - maxY;
+  }
+  const onCurb = curbClearance < -0.02;
+
+  const stars = (offset < 0.16 && angErr < 0.07 && collisions === 0 && !onCurb) ? 3
+              : (offset < 0.32 && angErr < 0.14 && collisions <= 1 && curbClearance > -0.15) ? 2 : 1;
   const mm = Math.floor(elapsed / 60), ss = Math.floor(elapsed % 60);
   let detail = `${mm}:${String(ss).padStart(2, '0')} · ${collisions} bump${collisions === 1 ? '' : 's'} · ${(angErr * 180 / Math.PI).toFixed(1)}° off axis`;
   if (level.curbCheck) {
-    let maxLy = -Infinity;
-    for (const [x, y] of boxCorners(b)) maxLy = Math.max(maxLy, spotFrame(x, y)[1]);
-    detail += ` · ${Math.max(0, level.spot.wid / 2 - maxLy).toFixed(2)} m to curb`;
+    detail += onCurb ? ` · on curb by ${(-curbClearance).toFixed(2)} m` : ` · ${curbClearance.toFixed(2)} m to curb`;
   }
   $('stars').textContent = '★'.repeat(stars) + '☆'.repeat(3 - stars);
   $('resultDetail').textContent = detail;
@@ -451,7 +467,7 @@ function draw() {
       ctx.restore();
     } else if (o.kind === 'wall') {
       drawBox(o, '#4a4f57');
-    } // 'curb' collision boxes are invisible; the sidewalk zone shows them
+    } // 'curb'/'curbWall' collision boxes are invisible; the sidewalk zone shows them
   }
 
   drawGuides();
