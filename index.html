@@ -43,8 +43,9 @@
   #wheel{width:56px;height:56px;flex:0 0 56px;transition:transform .05s linear}
   .keys{color:var(--muted);font-size:13px}
   .keys kbd{background:var(--panel2);border:1px solid var(--line);border-bottom-width:2px;border-radius:5px;padding:1px 6px;font-size:12px;color:var(--text)}
-  #resetBtn{width:100%;background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px;font-size:14px;cursor:pointer}
-  #resetBtn:hover{border-color:var(--accent)}
+  #resetBtn,#routeBtn{width:100%;background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px;font-size:14px;cursor:pointer}
+  #resetBtn:hover,#routeBtn:hover{border-color:var(--accent)}
+  #routeHint{color:var(--muted);font-size:12px;line-height:1.45;margin-top:-4px}
 </style>
 </head>
 <body>
@@ -116,8 +117,11 @@
     </div>
     <div class="box keys">
       <kbd>W</kbd>/<kbd>S</kbd> forward / reverse &nbsp; <kbd>A</kbd>/<kbd>D</kbd> steer<br>
-      <kbd>Space</kbd> straighten wheels &nbsp; <kbd>R</kbd> restart
+      <kbd>Space</kbd> straighten wheels &nbsp; <kbd>R</kbd> restart<br>
+      <kbd>Z</kbd>/<kbd>X</kbd> replay backward / forward
     </div>
+    <button id="routeBtn">🧭 Preview route from here</button>
+    <div id="routeHint" style="display:none">Solid teal = forward · dashed amber = reverse · white ghosts = gear switches. <kbd>Z</kbd>/<kbd>X</kbd> replay the run backward/forward — rewinding pauses at the teal box where the planner took over. Steer anytime to take control back.</div>
     <button id="resetBtn">↺ Restart (R)</button>
   </aside>
 </div>

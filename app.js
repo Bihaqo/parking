@@ -156,6 +156,11 @@ function reset() {
   done = false; collisions = 0; startTime = null; elapsed = 0;
   parkedTimer = 0; flash = 0; lastBumpAt = -1; guideDir = 1;
   sensors = { front: [Infinity, Infinity, Infinity], rear: [Infinity, Infinity, Infinity] };
+  route = null; boundary = -1;
+  replay = false; autoPlay = false; replayHold = 0; travelAcc = 0;
+  tape = [tapeSample()]; cursor = 0;
+  $('routeHint').style.display = 'none';
+  $('routeBtn').textContent = ROUTE_BTN_LABEL;
   $('overlay').classList.remove('show');
 }
 
@@ -199,6 +204,8 @@ function parktronicBeep(dist, now) {
 // ---------------------------------------------------------------- simulation
 function step(dt) {
   if (done) return;
+  if (replay) { stepReplay(dt); updateSensors(); beepForProximity(); return; }
+  if (keys.KeyZ) { enterReplay(); return; }
   const left = keys.KeyA || keys.ArrowLeft, right = keys.KeyD || keys.ArrowRight;
   const fwd = keys.KeyW || keys.ArrowUp, back = keys.KeyS || keys.ArrowDown;
 
@@ -247,14 +254,20 @@ function step(dt) {
   }
   flash = Math.max(0, flash - dt);
 
-  updateSensors();
+  // record onto the tape once per TAPE_DS of actual travel
+  travelAcc += Math.hypot(car.x - prev.x, car.y - prev.y);
+  if (travelAcc >= TAPE_DS) { tape.push(tapeSample()); travelAcc = 0; }
 
-  // parktronic beeps: direction-aware, both bumpers when stopped
+  updateSensors();
+  beepForProximity();
+  checkSuccess(dt);
+}
+
+// parktronic beeps: direction-aware, both bumpers when stopped
+function beepForProximity() {
   const fMin = Math.min(...sensors.front), rMin = Math.min(...sensors.rear);
   const watch = car.v > 0.05 ? fMin : car.v < -0.05 ? rMin : Math.min(fMin, rMin);
   parktronicBeep(watch, performance.now());
-
-  checkSuccess(dt);
 }
 
 function updateSensors() {
@@ -281,15 +294,16 @@ function spotFrame(px, py) {
   return [dx * c + dy * s, -dx * s + dy * c];
 }
 
-function insideSpot() {
+function insideSpotAt(pose) {
   const sp = level.spot;
-  for (const [x, y] of boxCorners(carBox())) {
+  for (const [x, y] of boxCorners(carBox(pose))) {
     const [lx, ly] = spotFrame(x, y);
     if (Math.abs(lx) > sp.len / 2 + 0.03 || Math.abs(ly) > sp.wid / 2 + 0.03) return false;
   }
-  const d = wrapPi(car.theta - sp.theta);
+  const d = wrapPi(pose.theta - sp.theta);
   return Math.abs(d) < 0.21 || Math.abs(wrapPi(d - Math.PI)) < 0.21;
 }
+const insideSpot = () => insideSpotAt(car);
 
 function checkSuccess(dt) {
   if (insideSpot() && Math.abs(car.v) < 0.05) parkedTimer += dt; else parkedTimer = 0;
@@ -323,6 +337,261 @@ function checkSuccess(dt) {
   $('overlay').classList.add('show');
   tone(660, 0.12, 0.06, 'sine');
   setTimeout(() => tone(880, 0.2, 0.06, 'sine'), 130);
+}
+
+// ---------------------------------------------------------------- route planner (Hybrid A*)
+// Searches over (x, y, theta, gear) with short forward/reverse arcs of the same
+// bicycle model the car drives, so the returned route is actually drivable.
+let route = null;
+const STEERS = [-CAR.maxSteer, -CAR.maxSteer / 2, 0, CAR.maxSteer / 2, CAR.maxSteer];
+const PLAN = {
+  res: 0.25, thBins: 72, step: 0.4,       // grid cell (m), heading bins, arc length per expansion (m)
+  weight: 1.6,                            // heuristic inflation (trades optimality for speed)
+  revCost: 1.15, switchCost: 0.7, steerCost: 0.08,
+  maxExpand: 200000, maxMs: 2500,
+};
+
+function heapPush(a, n) {
+  a.push(n);
+  for (let i = a.length - 1; i > 0;) {
+    const p = (i - 1) >> 1;
+    if (a[p].f <= a[i].f) break;
+    [a[p], a[i]] = [a[i], a[p]]; i = p;
+  }
+}
+function heapPop(a) {
+  const top = a[0], last = a.pop();
+  if (a.length) {
+    a[0] = last;
+    for (let i = 0;;) {
+      const l = 2 * i + 1, r = l + 1;
+      let m = i;
+      if (l < a.length && a[l].f < a[m].f) m = l;
+      if (r < a.length && a[r].f < a[m].f) m = r;
+      if (m === i) break;
+      [a[m], a[i]] = [a[i], a[m]]; i = m;
+    }
+  }
+  return top;
+}
+
+function planRoute() {
+  const sp = level.spot;
+  // plan off the soft curb entirely — unless we're already on it, then only the hard wall blocks
+  let obs = level.obstacles.filter(o => o.kind !== 'curbWall');
+  if (obs.some(o => o.kind === 'curb' && boxesCollide(carBox(car), o)))
+    obs = level.obstacles.filter(o => o.kind !== 'curb');
+
+  // coarse clearance field: cheap broad-phase so most collision tests are one lookup
+  const FRES = 0.5, FNX = Math.ceil(WORLD.w / FRES), FNY = Math.ceil(WORLD.h / FRES);
+  const field = new Float32Array(FNX * FNY);
+  for (let ix = 0; ix < FNX; ix++) for (let iy = 0; iy < FNY; iy++) {
+    const px = (ix + 0.5) * FRES, py = (iy + 0.5) * FRES;
+    let d = Math.min(px, py, WORLD.w - px, WORLD.h - py);
+    for (const o of obs) d = Math.min(d, distPointToBox(px, py, o));
+    field[ix * FNY + iy] = d;
+  }
+  const halfDiag = Math.hypot(CAR.len, CAR.wid) / 2;
+  const cellSlack = FRES * Math.SQRT1_2; // field is sampled at cell centers
+
+  function collides(pose) {
+    const b = carBox(pose);
+    const fx = clamp(Math.floor(b.cx / FRES), 0, FNX - 1);
+    const fy = clamp(Math.floor(b.cy / FRES), 0, FNY - 1);
+    if (field[fx * FNY + fy] - cellSlack > halfDiag) return false;
+    if (carHitsWorld(b)) return true;
+    for (const o of obs) if (boxesCollide(b, o)) return true;
+    return false;
+  }
+
+  // rear-axle poses that put the body dead center in the spot, either way round
+  const spotTargets = [sp.theta, sp.theta + Math.PI].map(t => ({
+    x: sp.cx - Math.cos(t) * CAR.axleToCenter,
+    y: sp.cy - Math.sin(t) * CAR.axleToCenter, theta: t,
+  }));
+  const spotGoal = {
+    targets: spotTargets,
+    quality(pose) { // 2 = clean 3-star pose, 1 = merely inside the spot
+      if (!insideSpotAt(pose)) return 0;
+      const b = carBox(pose);
+      const [, ly] = spotFrame(b.cx, b.cy);
+      const ang = Math.min(...spotTargets.map(g => Math.abs(wrapPi(pose.theta - g.theta))));
+      return Math.abs(ly) < 0.15 && ang < 0.08 ? 2 : 1;
+    },
+  };
+  const poseGoal = target => ({
+    targets: [target],
+    quality: p => Math.hypot(p.x - target.x, p.y - target.y) < 0.22
+      && Math.abs(wrapPi(p.theta - target.theta)) < 0.09 ? 2 : 0,
+  });
+
+  const NY = Math.ceil(WORLD.h / PLAN.res), THN = PLAN.thBins;
+  const keyOf = (p, dir) => {
+    const th = Math.floor((((p.theta % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI)) / (2 * Math.PI) * THN) % THN;
+    return ((Math.floor(p.x / PLAN.res) * NY + Math.floor(p.y / PLAN.res)) * THN + th) * 2 + (dir < 0 ? 1 : 0);
+  };
+
+  function search(from, goal) {
+    const heur = p => Math.min(...goal.targets.map(g => Math.hypot(p.x - g.x, p.y - g.y)));
+    const nodes = new Map(), heap = [];
+    const pushNode = n => { n.f = n.g + PLAN.weight * heur(n); nodes.set(n.k, n); heapPush(heap, n); };
+    for (const dir of [1, -1]) {
+      pushNode({ x: from.x, y: from.y, theta: from.theta, g: 0, dir, steer: 0, parent: null, k: keyOf(from, dir) });
+    }
+    const t0 = performance.now();
+    const SUB = 2, hstep = PLAN.step / SUB;
+    let fallback = null, expansions = 0;
+    while (heap.length) {
+      const cur = heapPop(heap);
+      if (nodes.get(cur.k) !== cur) continue; // stale heap entry
+      const q = goal.quality(cur);
+      if (q === 2) return cur;
+      if (q === 1 && !fallback) fallback = cur;
+      if (++expansions > PLAN.maxExpand || performance.now() - t0 > PLAN.maxMs) break;
+      for (const dir of [1, -1]) for (const steer of STEERS) {
+        const p = { x: cur.x, y: cur.y, theta: cur.theta };
+        let blocked = false;
+        for (let s = 0; s < SUB; s++) {
+          p.x += Math.cos(p.theta) * hstep * dir;
+          p.y += Math.sin(p.theta) * hstep * dir;
+          p.theta += (hstep * dir / CAR.wheelbase) * Math.tan(steer);
+          if (collides(p)) { blocked = true; break; }
+        }
+        if (blocked) continue;
+        const g = cur.g + PLAN.step * (dir < 0 ? PLAN.revCost : 1)
+          + (dir !== cur.dir ? PLAN.switchCost : 0)
+          + PLAN.steerCost * Math.abs(steer - cur.steer);
+        const k = keyOf(p, dir);
+        const ex = nodes.get(k);
+        if (ex && ex.g <= g) continue;
+        pushNode({ x: p.x, y: p.y, theta: p.theta, g, dir, steer, parent: cur, k });
+      }
+    }
+    return fallback;
+  }
+
+  const start = { x: car.x, y: car.y, theta: car.theta };
+  if (spotGoal.quality(start) === 2) return { already: true };
+
+  // Textbook opener: when still approaching a parallel spot, first pull up
+  // parallel to the car ahead of the gap (rear bumpers level, ~0.7 m between
+  // cars), then back in — the maneuver a driving instructor teaches.
+  if (settings.type === 'parallel') {
+    const ahead = obs.filter(o => o.kind === 'car' && o.cx > sp.cx).sort((a, b) => a.cx - b.cx)[0];
+    if (ahead) {
+      const setup = {
+        x: ahead.cx - ahead.w / 2 + CAR.rearOverhang,       // rear bumpers level
+        y: ahead.cy - ahead.h / 2 - CAR.wid / 2 - 0.7,      // ~0.7 m door-to-door
+        theta: 0,
+      };
+      const approaching = Math.abs(wrapPi(start.theta)) < 0.35
+        && start.y < setup.y + 0.7 && start.x < setup.x - 0.3;
+      if (approaching && !collides(setup)) {
+        const n1 = search(start, poseGoal(setup));
+        const n2 = n1 && search({ x: n1.x, y: n1.y, theta: n1.theta }, spotGoal);
+        if (n2) return concatRoutes(buildRoute(n1), buildRoute(n2));
+      }
+    }
+  }
+
+  const n = search(start, spotGoal);
+  return n ? buildRoute(n) : null;
+}
+
+function concatRoutes(a, b) {
+  const segs = a.segs.slice();
+  const last = segs[segs.length - 1];
+  let rest = b.segs;
+  if (last && rest.length && last.dir === rest[0].dir) {
+    last.pts = last.pts.concat(rest[0].pts.slice(1));
+    rest = rest.slice(1);
+  }
+  // a's final ghost stays: it marks the textbook setup position
+  return { segs: segs.concat(rest), ghosts: a.ghosts.concat(b.ghosts), poses: a.poses.concat(b.poses.slice(1)) };
+}
+
+function buildRoute(goalNode) {
+  const chain = [];
+  for (let n = goalNode; n; n = n.parent) chain.push(n);
+  chain.reverse();
+  const center = p => [p.x + Math.cos(p.theta) * CAR.axleToCenter, p.y + Math.sin(p.theta) * CAR.axleToCenter];
+  const segs = [], ghosts = [];
+  const first = chain[1] || { steer: 0, dir: 1 };
+  const poses = [{ x: chain[0].x, y: chain[0].y, theta: chain[0].theta, steer: first.steer, dir: first.dir }];
+  const FINE = 5, hstep = PLAN.step / FINE;
+  let seg = null;
+  for (let i = 1; i < chain.length; i++) {
+    const n = chain[i], from = chain[i - 1];
+    if (!seg || seg.dir !== n.dir) {
+      if (seg) ghosts.push({ x: from.x, y: from.y, theta: from.theta });
+      seg = { dir: n.dir, pts: [center(from)] };
+      segs.push(seg);
+    }
+    const p = { x: from.x, y: from.y, theta: from.theta };
+    for (let s = 0; s < FINE; s++) {
+      p.x += Math.cos(p.theta) * hstep * n.dir;
+      p.y += Math.sin(p.theta) * hstep * n.dir;
+      p.theta += (hstep * n.dir / CAR.wheelbase) * Math.tan(n.steer);
+      seg.pts.push(center(p));
+      poses.push({ x: p.x, y: p.y, theta: p.theta, steer: n.steer, dir: n.dir });
+    }
+  }
+  const last = chain[chain.length - 1];
+  ghosts.push({ x: last.x, y: last.y, theta: last.theta });
+  return { segs, ghosts, poses };
+}
+
+// ---------------------------------------------------------------- drive tape & replay
+// Everything you drive is recorded on a tape. The planner appends its route to
+// the tape and auto-plays it; Z/X replay the whole sequence backward/forward,
+// and any driving key takes control back at the current tape position.
+const TAPE_DS = PLAN.step / 5;                 // one sample per 8 cm of travel (matches route poses)
+const REPLAY = { speed: 2.0, holdSwitch: 0.5, holdBoundary: 0.6 };
+let tape = [], cursor = 0, boundary = -1;
+let replay = false, autoPlay = false, replayHold = 0, travelAcc = 0;
+
+const tapeSample = planned =>
+  ({ x: car.x, y: car.y, theta: car.theta, steer: car.steer, dir: guideDir, planned: !!planned });
+
+function enterReplay() {
+  const last = tape[tape.length - 1];
+  if (Math.hypot(car.x - last.x, car.y - last.y) > 1e-3) tape.push(tapeSample());
+  cursor = tape.length - 1;
+  replay = true; autoPlay = false; replayHold = 0;
+  car.v = 0;
+}
+
+function takeOver() { // resume manual control at the replay cursor, discarding what's ahead
+  cursor = Math.floor(cursor);
+  tape.length = cursor + 1;
+  const p = tape[cursor];
+  car.x = p.x; car.y = p.y; car.theta = p.theta; car.steer = p.steer; car.v = 0;
+  if (boundary >= tape.length) boundary = -1;
+  replay = false; autoPlay = false; replayHold = 0; travelAcc = 0; parkedTimer = 0;
+}
+
+function stepReplay(dt) {
+  if (startTime !== null) startTime += dt * 1000; // freeze the attempt clock while replaying
+  if (replayHold > 0) { replayHold -= dt; car.v = 0; if (replayHold > 0) return; }
+  const rew = keys.KeyZ, fwd = keys.KeyX;
+  let dir = 0;
+  if (rew !== fwd) { dir = rew ? -1 : 1; autoPlay = false; }
+  else if (autoPlay) dir = 1;
+  if (dir === 0) { car.v = 0; return; }
+  const prevI = Math.floor(cursor);
+  cursor = clamp(cursor + dir * (REPLAY.speed / TAPE_DS) * dt, 0, tape.length - 1);
+  let i = Math.floor(cursor);
+  if (dir < 0 && boundary >= 0 && prevI > boundary && i <= boundary) {
+    // snap-pause right where you handed over to the planner, so you can redo from there
+    cursor = i = boundary; replayHold = REPLAY.holdBoundary;
+  } else if (autoPlay && tape[i].dir !== tape[prevI].dir) {
+    replayHold = REPLAY.holdSwitch; // gear change
+  }
+  const p = tape[i];
+  car.x = p.x; car.y = p.y; car.theta = p.theta; car.steer = p.steer;
+  guideDir = p.dir;
+  car.v = replayHold > 0 ? 0 : p.dir * dir * REPLAY.speed;
+  if (autoPlay && i >= tape.length - 1) { autoPlay = false; car.v = 0; }
 }
 
 // ---------------------------------------------------------------- drawing
@@ -407,6 +676,72 @@ function drawGuides() {
   ctx.restore();
 }
 
+function drawOverlays() {
+  if (done) return;
+  ctx.save();
+  ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  // faint trail of the whole recorded sequence while replaying
+  if (replay && tape.length > 1) {
+    ctx.strokeStyle = 'rgba(232,236,241,0.16)'; ctx.lineWidth = 0.07;
+    ctx.beginPath();
+    tape.forEach((p, i) => {
+      const x = p.x + Math.cos(p.theta) * CAR.axleToCenter;
+      const y = p.y + Math.sin(p.theta) * CAR.axleToCenter;
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    });
+    ctx.stroke();
+  }
+  for (const seg of route ? route.segs : []) {
+    const col = seg.dir > 0 ? 'rgba(79,209,197,0.9)' : 'rgba(251,191,36,0.9)';
+    ctx.strokeStyle = col; ctx.lineWidth = 0.09;
+    ctx.setLineDash(seg.dir > 0 ? [] : [0.32, 0.22]);
+    ctx.beginPath();
+    seg.pts.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
+    ctx.stroke();
+    // chevrons pointing the way the car travels
+    ctx.setLineDash([]);
+    ctx.fillStyle = col;
+    let acc = 0.9;
+    for (let i = 1; i < seg.pts.length; i++) {
+      const [x0, y0] = seg.pts[i - 1], [x1, y1] = seg.pts[i];
+      acc += Math.hypot(x1 - x0, y1 - y0);
+      if (acc < 1.5) continue;
+      acc = 0;
+      ctx.save(); ctx.translate(x1, y1); ctx.rotate(Math.atan2(y1 - y0, x1 - x0));
+      ctx.beginPath();
+      ctx.moveTo(0.24, 0); ctx.lineTo(-0.12, -0.18); ctx.lineTo(-0.12, 0.18);
+      ctx.closePath(); ctx.fill();
+      ctx.restore();
+    }
+  }
+  // ghost outlines where you switch gear, and at the final pose
+  ctx.setLineDash([0.22, 0.16]);
+  ctx.strokeStyle = 'rgba(232,236,241,0.45)'; ctx.lineWidth = 0.05;
+  for (const g of route ? route.ghosts : []) {
+    const b = carBox(g);
+    ctx.save(); ctx.translate(b.cx, b.cy); ctx.rotate(b.theta);
+    roundRect(-b.w / 2, -b.h / 2, b.w, b.h, 0.32); ctx.stroke();
+    ctx.restore();
+  }
+  // teal marker where you stopped and the planner took over
+  if (boundary >= 0 && boundary < tape.length) {
+    const b = carBox(tape[boundary]);
+    ctx.setLineDash([0.15, 0.12]);
+    ctx.strokeStyle = 'rgba(62,199,186,0.8)'; ctx.lineWidth = 0.07;
+    ctx.save(); ctx.translate(b.cx, b.cy); ctx.rotate(b.theta);
+    roundRect(-b.w / 2, -b.h / 2, b.w, b.h, 0.32); ctx.stroke();
+    ctx.restore();
+  }
+  ctx.restore();
+  if (replay) {
+    ctx.save(); ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = 'rgba(232,236,241,0.75)';
+    ctx.font = '600 13px system-ui'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+    ctx.fillText((autoPlay ? 'PREVIEW' : 'REPLAY') + ' — Z ◀ · X ▶ · steer to take over', 12, 10);
+    ctx.restore();
+  }
+}
+
 function drawSensors() {
   const b = carBox();
   ctx.save(); ctx.translate(b.cx, b.cy); ctx.rotate(b.theta);
@@ -470,6 +805,7 @@ function draw() {
     } // 'curb'/'curbWall' collision boxes are invisible; the sidewalk zone shows them
   }
 
+  drawOverlays();
   drawGuides();
   drawPlayerCar();
   drawSensors();
@@ -503,12 +839,15 @@ function updateHUD() {
 }
 
 // ---------------------------------------------------------------- input & UI
-const HANDLED = new Set(['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space', 'KeyR']);
+const HANDLED = new Set(['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space', 'KeyR', 'KeyZ', 'KeyX']);
 window.addEventListener('keydown', e => {
   if (e.repeat) { if (HANDLED.has(e.code)) e.preventDefault(); return; }
   ensureAudio();
   if (e.code === 'KeyR') { reset(); e.preventDefault(); return; }
-  if (HANDLED.has(e.code)) { keys[e.code] = true; e.preventDefault(); }
+  if (HANDLED.has(e.code)) {
+    if (replay && e.code !== 'KeyZ' && e.code !== 'KeyX') takeOver(); // steering takes control back
+    keys[e.code] = true; e.preventDefault();
+  }
 });
 window.addEventListener('keyup', e => { keys[e.code] = false; });
 window.addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
@@ -538,6 +877,30 @@ for (const [id, key] of [['guidesChk', 'guides'], ['soundChk', 'sound'], ['autoC
 }
 $('resetBtn').addEventListener('click', () => { ensureAudio(); reset(); });
 $('againBtn').addEventListener('click', () => reset());
+
+const ROUTE_BTN_LABEL = '🧭 Preview route from here';
+let routeBtnTimer = 0;
+$('routeBtn').addEventListener('click', () => {
+  ensureAudio();
+  if (done) return;
+  const btn = $('routeBtn');
+  const flashLabel = txt => {
+    btn.textContent = txt;
+    clearTimeout(routeBtnTimer);
+    routeBtnTimer = setTimeout(() => { btn.textContent = route ? '🧭 Replan from here' : ROUTE_BTN_LABEL; }, 1600);
+  };
+  if (replay) takeOver(); // "here" = wherever the replay cursor is right now
+  const r = planRoute();
+  if (r && r.already) { flashLabel('Already parked ✓'); return; }
+  if (!r) { flashLabel('No route found'); return; }
+  route = r;
+  enterReplay();
+  boundary = cursor; // where you stopped and the planner takes over
+  for (let i = 1; i < r.poses.length; i++) tape.push({ ...r.poses[i], planned: true });
+  autoPlay = true;
+  btn.textContent = '🧭 Replan from here';
+  $('routeHint').style.display = '';
+});
 
 // ---------------------------------------------------------------- main loop
 reset();
